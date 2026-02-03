@@ -26,6 +26,28 @@ logger = logging.getLogger(__name__)
 os.environ["TQDM_DISABLE"] = "1"
 
 
+def log_gpu_info():
+    """Log GPU information for debugging"""
+    if torch.cuda.is_available():
+        logger.info(f"[GPU] CUDA available: True")
+        logger.info(f"[GPU] CUDA version: {torch.version.cuda}")
+        logger.info(f"[GPU] Device count: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            logger.info(f"[GPU] Device {i}: {props.name}, {props.total_memory / 1024**3:.1f}GB")
+        logger.info(f"[GPU] Current device: {torch.cuda.current_device()}")
+    else:
+        logger.warning("[GPU] CUDA NOT available!")
+
+
+def log_gpu_memory():
+    """Log current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"[GPU Memory] Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+
+
 class BGEM3SparseModel:
     """
     Ultra-optimized BGE-M3 sparse embedding model using FlagEmbedding.
@@ -50,6 +72,9 @@ class BGEM3SparseModel:
         # For GPU, use larger batches; for CPU, use smaller batches
         self.micro_batch_size = int(os.environ.get("MICRO_BATCH_SIZE", "8" if device == "cpu" else "32"))
 
+        # Log GPU info at startup
+        log_gpu_info()
+
         # Import FlagEmbedding
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -69,6 +94,8 @@ class BGEM3SparseModel:
         use_fp16 = dtype in [torch.float16, torch.bfloat16]
 
         logger.info(f"Loading BGEM3FlagModel from {model_id}...")
+        logger.info(f"[GPU] Requesting device: {self.device}, use_fp16: {use_fp16}")
+        
         self.flag_model = BGEM3FlagModel(
             model_id,
             use_fp16=use_fp16,
@@ -77,8 +104,19 @@ class BGEM3SparseModel:
 
         # Get internal model for direct forward pass
         self._model = self.flag_model.model
+        
+        # Verify model device BEFORE .to()
+        logger.info(f"[GPU] Model device BEFORE .to(): {next(self._model.parameters()).device}")
+        
         self._model = self._model.to(self.device)
         self._model.eval()
+        
+        # Verify model device AFTER .to()
+        logger.info(f"[GPU] Model device AFTER .to(): {next(self._model.parameters()).device}")
+        logger.info(f"[GPU] Model dtype: {next(self._model.parameters()).dtype}")
+        
+        # Log GPU memory after model load
+        log_gpu_memory()
 
         # Get tokenizer
         self.tokenizer = self.flag_model.tokenizer
@@ -104,6 +142,8 @@ class BGEM3SparseModel:
         for tid in self._special_token_ids:
             if 0 <= tid < self.vocab_size:
                 self._special_mask[tid] = True
+        
+        logger.info(f"[GPU] Special mask device: {self._special_mask.device}")
 
         # Compile model for faster inference (PyTorch 2.0+)
         if compile_model and hasattr(torch, "compile") and self.device.type == "cuda":
@@ -137,6 +177,7 @@ class BGEM3SparseModel:
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
 
+        log_gpu_memory()
         logger.info("Warmup complete")
 
     def _tokenize(
@@ -261,7 +302,7 @@ class BGEM3SparseModel:
         """
         start_time = time.perf_counter()
         total_size = len(texts)
-        logger.info(f"[embed_sparse] Input batch size: {total_size}")
+        logger.info(f"[embed_sparse] Input batch size: {total_size}, device: {self.device}")
 
         # Use micro-batching for better CPU cache performance
         if total_size <= self.micro_batch_size:
@@ -273,6 +314,10 @@ class BGEM3SparseModel:
                 batch_results = self._embed_sparse_batch(batch_texts, truncate)
                 results.extend(batch_results)
 
+        # Sync GPU and log
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
             f"[embed_sparse] Completed in {elapsed_ms:.2f}ms for {total_size} texts ({elapsed_ms/total_size:.2f}ms/text)"
@@ -295,7 +340,7 @@ class BGEM3SparseModel:
         """Generate dense embeddings with normalization and micro-batching"""
         start_time = time.perf_counter()
         total_size = len(texts)
-        logger.info(f"[embed_dense] Input batch size: {total_size}")
+        logger.info(f"[embed_dense] Input batch size: {total_size}, device: {self.device}")
 
         # Use micro-batching for better CPU cache performance
         if total_size <= self.micro_batch_size:
@@ -306,6 +351,10 @@ class BGEM3SparseModel:
                 batch_texts = texts[i:i + self.micro_batch_size]
                 batch_results = self._embed_dense_batch(batch_texts)
                 results.extend(batch_results)
+
+        # Sync GPU and log
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
