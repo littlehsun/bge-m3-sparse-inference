@@ -3,13 +3,12 @@ BGE-M3 Sparse Model - Maximum Speed Optimization
 
 Key optimizations:
 1. Uses FlagEmbedding BGEM3FlagModel for native sparse support
-2. torch.compile() for GPU kernel fusion (PyTorch 2.0+)
+2. Vectorized sparse result building (no Python loops on vocab)
 3. Pre-allocated tensors for sparse processing
 4. No torch.unique() - uses scatter_reduce instead
 5. Minimal CPU-GPU transfers
 6. Float16 inference on GPU
 7. Cached special token mask (created once, not per-batch)
-8. Micro-batching for CPU to optimize cache usage
 """
 
 import os
@@ -68,8 +67,7 @@ class BGEM3SparseModel:
         self.max_batch_size = max_batch_size
         self.max_length = max_length
         
-        # Micro-batch size for CPU optimization (smaller batches = better cache usage)
-        # For GPU, use larger batches; for CPU, use smaller batches
+        # Micro-batch size
         self.micro_batch_size = int(os.environ.get("MICRO_BATCH_SIZE", "8" if device == "cpu" else "32"))
 
         # Log GPU info at startup
@@ -145,17 +143,6 @@ class BGEM3SparseModel:
         
         logger.info(f"[GPU] Special mask device: {self._special_mask.device}")
 
-        # Compile model for faster inference (PyTorch 2.0+)
-        if compile_model and hasattr(torch, "compile") and self.device.type == "cuda":
-            logger.info("Compiling model with torch.compile()...")
-            try:
-                self._model = torch.compile(self._model, mode="reduce-overhead")
-                logger.info("Model compiled successfully!")
-            except Exception as e:
-                logger.warning(
-                    f"torch.compile() failed: {e}, continuing without compilation"
-                )
-
         # Warmup
         self._warmup()
 
@@ -169,9 +156,7 @@ class BGEM3SparseModel:
         dummy_texts = ["warmup text"] * min(4, self.max_batch_size)
 
         with torch.inference_mode():
-            # Warmup sparse
             _ = self._embed_sparse_batch(dummy_texts)
-            # Warmup dense
             _ = self._embed_dense_batch(dummy_texts)
 
             if self.device.type == "cuda":
@@ -201,11 +186,8 @@ class BGEM3SparseModel:
         }
 
     def _model_forward(self, inputs: Dict[str, torch.Tensor], return_dense: bool, return_sparse: bool) -> Dict[str, Any]:
-        """
-        Forward pass with compatibility for different FlagEmbedding versions.
-        """
+        """Forward pass with compatibility for different FlagEmbedding versions."""
         try:
-            # Try new API first (FlagEmbedding >= 1.2.10)
             outputs = self._model(
                 inputs,
                 return_dense=return_dense,
@@ -214,7 +196,6 @@ class BGEM3SparseModel:
                 return_sparse_embedding=False,
             )
         except TypeError:
-            # Fallback to old API (FlagEmbedding < 1.2.10)
             outputs = self._model(
                 inputs,
                 return_dense=return_dense,
@@ -227,17 +208,25 @@ class BGEM3SparseModel:
         texts: List[str],
         truncate: bool = True,
     ) -> List[List[Dict[str, Any]]]:
-        """Process a single batch of texts for sparse embeddings"""
+        """Process a single batch of texts for sparse embeddings - OPTIMIZED"""
         batch_size = len(texts)
         
-        # Tokenize
+        # === TIMING: Tokenize ===
+        t0 = time.perf_counter()
         inputs = self._tokenize(texts, truncate)
         input_ids = inputs["input_ids"]
+        t_tokenize = (time.perf_counter() - t0) * 1000
 
-        # Forward pass to get sparse weights
+        # === TIMING: Model forward ===
+        t0 = time.perf_counter()
         outputs = self._model_forward(inputs, return_dense=False, return_sparse=True)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_forward = (time.perf_counter() - t0) * 1000
 
-        # Get token weights
+        # === TIMING: Post-processing (VECTORIZED) ===
+        t0 = time.perf_counter()
+        
         token_weights = outputs["sparse_vecs"]
         if token_weights.dim() == 3:
             token_weights = token_weights.squeeze(-1)
@@ -251,11 +240,11 @@ class BGEM3SparseModel:
             dtype=token_weights.dtype,
         )
 
-        # Mask special tokens (use pre-cached mask)
+        # Mask special tokens
         is_special = self._special_mask[input_ids]
         token_weights_masked = token_weights.masked_fill(is_special, 0.0)
 
-        # Scatter max: aggregate max weight per token ID
+        # Scatter max
         sparse_dense.scatter_reduce_(
             dim=1,
             index=input_ids.long(),
@@ -264,28 +253,40 @@ class BGEM3SparseModel:
             include_self=True,
         )
 
-        # Get non-zero mask
-        nonzero_mask = sparse_dense > 0
+        # Apply threshold on GPU before transfer
+        sparse_dense = sparse_dense * (sparse_dense > 0.001).float()
+        
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_postprocess = (time.perf_counter() - t0) * 1000
 
-        # Transfer to CPU ONCE
+        # === TIMING: Build results (VECTORIZED - much faster!) ===
+        t0 = time.perf_counter()
+        
+        # Find ALL non-zero positions at once using torch.nonzero
+        # This is MUCH faster than per-row torch.where
+        nonzero_coords = torch.nonzero(sparse_dense, as_tuple=False).cpu()
         sparse_dense_cpu = sparse_dense.cpu()
-        nonzero_mask_cpu = nonzero_mask.cpu()
+        
+        # Pre-allocate results list
+        results: List[List[Dict[str, Any]]] = [[] for _ in range(batch_size)]
+        
+        if len(nonzero_coords) > 0:
+            batch_indices = nonzero_coords[:, 0].numpy()
+            token_indices = nonzero_coords[:, 1].numpy()
+            weights = sparse_dense_cpu[nonzero_coords[:, 0], nonzero_coords[:, 1]].numpy()
+            
+            # Group by batch index - use numpy for speed
+            for i in range(len(batch_indices)):
+                batch_idx = batch_indices[i]
+                results[batch_idx].append({
+                    "index": int(token_indices[i]),
+                    "value": round(float(weights[i]), 6)
+                })
+        
+        t_build = (time.perf_counter() - t0) * 1000
 
-        # Build results
-        results = []
-        for i in range(batch_size):
-            mask_i = nonzero_mask_cpu[i]
-            if mask_i.any():
-                indices = torch.where(mask_i)[0].tolist()
-                weights = sparse_dense_cpu[i, mask_i].tolist()
-                sparse_values = [
-                    {"index": idx, "value": round(w, 6)}
-                    for idx, w in zip(indices, weights)
-                    if w > 0.001
-                ]
-            else:
-                sparse_values = []
-            results.append(sparse_values)
+        logger.info(f"[TIMING] batch={batch_size}: tokenize={t_tokenize:.1f}ms, forward={t_forward:.1f}ms, postprocess={t_postprocess:.1f}ms, build={t_build:.1f}ms")
 
         return results
 
@@ -295,16 +296,11 @@ class BGEM3SparseModel:
         texts: List[str],
         truncate: bool = True,
     ) -> List[List[Dict[str, Any]]]:
-        """
-        Generate sparse embeddings using optimized pipeline with micro-batching.
-
-        Returns: List of sparse embeddings, each is List[{"index": int, "value": float}]
-        """
+        """Generate sparse embeddings with micro-batching."""
         start_time = time.perf_counter()
         total_size = len(texts)
         logger.info(f"[embed_sparse] Input batch size: {total_size}, device: {self.device}")
 
-        # Use micro-batching for better CPU cache performance
         if total_size <= self.micro_batch_size:
             results = self._embed_sparse_batch(texts, truncate)
         else:
@@ -314,7 +310,6 @@ class BGEM3SparseModel:
                 batch_results = self._embed_sparse_batch(batch_texts, truncate)
                 results.extend(batch_results)
 
-        # Sync GPU and log
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         
@@ -327,12 +322,9 @@ class BGEM3SparseModel:
     def _embed_dense_batch(self, texts: List[str]) -> List[List[float]]:
         """Process a single batch of texts for dense embeddings"""
         inputs = self._tokenize(texts, truncate=True)
-
         outputs = self._model_forward(inputs, return_dense=True, return_sparse=False)
-
         dense_vecs = outputs["dense_vecs"]
         dense_vecs = F.normalize(dense_vecs, p=2, dim=-1)
-
         return dense_vecs.cpu().tolist()
 
     @torch.inference_mode()
@@ -342,7 +334,6 @@ class BGEM3SparseModel:
         total_size = len(texts)
         logger.info(f"[embed_dense] Input batch size: {total_size}, device: {self.device}")
 
-        # Use micro-batching for better CPU cache performance
         if total_size <= self.micro_batch_size:
             results = self._embed_dense_batch(texts)
         else:
@@ -352,7 +343,6 @@ class BGEM3SparseModel:
                 batch_results = self._embed_dense_batch(batch_texts)
                 results.extend(batch_results)
 
-        # Sync GPU and log
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 

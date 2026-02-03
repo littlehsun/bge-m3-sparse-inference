@@ -8,6 +8,7 @@ API compatible with text-embeddings-inference /embed_sparse
 import os
 import asyncio
 import logging
+import threading
 from typing import List, Optional, Union
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Global model instance
 model: Optional[BGEM3SparseModel] = None
+
+# GPU inference lock - ensure only ONE inference runs at a time
+# This prevents GPU resource contention and memory allocation conflicts
+inference_lock = threading.Lock()
 
 
 class EmbedSparseRequest(BaseModel):
@@ -80,6 +85,18 @@ app = FastAPI(
 )
 
 
+def run_embed_sparse_sync(inputs: List[str], truncate: bool):
+    """Run sparse embedding with lock to prevent GPU contention"""
+    with inference_lock:
+        return model.embed_sparse(inputs, truncate)
+
+
+def run_embed_dense_sync(inputs: List[str]):
+    """Run dense embedding with lock to prevent GPU contention"""
+    with inference_lock:
+        return model.embed_dense(inputs)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
@@ -108,11 +125,11 @@ async def embed_sparse(request: EmbedSparseRequest):
             detail=f"Batch size {len(inputs)} exceeds max {model.max_batch_size}"
         )
     
-    # Run inference in thread pool to not block event loop
+    # Run inference in thread pool with lock to prevent GPU contention
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None, 
-        model.embed_sparse, 
+        run_embed_sparse_sync, 
         inputs,
         request.truncate,
     )
@@ -140,7 +157,7 @@ async def embed(request: EmbedRequest):
         )
     
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, model.embed_dense, inputs)
+    result = await loop.run_in_executor(None, run_embed_dense_sync, inputs)
     
     return result
 
