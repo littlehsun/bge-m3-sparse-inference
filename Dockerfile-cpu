@@ -1,0 +1,51 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Build args for proxy
+ARG http_proxy
+ARG https_proxy
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CPU-only PyTorch first
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install transformers first with PINNED version (FlagEmbedding requires <4.46.0)
+# Then install FlagEmbedding with --no-deps to prevent it from upgrading transformers
+RUN pip install --no-cache-dir "transformers>=4.40.0,<4.46.0" && \
+    pip install --no-cache-dir \
+    tokenizers \
+    fastapi \
+    "uvicorn[standard]" \
+    pydantic \
+    accelerate \
+    peft \
+    sentencepiece \
+    huggingface_hub && \
+    pip install --no-cache-dir --no-deps FlagEmbedding && \
+    pip install --no-cache-dir sentence_transformers datasets scipy scikit-learn pandas
+
+COPY main.py model.py ./
+
+# Pre-download model weights during build
+RUN python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3', use_fp16=False, device='cpu')" && \
+    echo "Model downloaded successfully"
+
+ENV MODEL_ID=BAAI/bge-m3
+ENV DEVICE=cpu
+ENV DTYPE=float32
+ENV MAX_BATCH_SIZE=128
+ENV PORT=8080
+ENV OMP_NUM_THREADS=16
+ENV MKL_NUM_THREADS=16
+ENV HF_HOME=/root/.cache/huggingface
+
+EXPOSE 8080
+
+CMD ["python", "main.py"]
