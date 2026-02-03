@@ -6,9 +6,12 @@ Key optimizations:
 2. Vectorized sparse result building (no Python loops on vocab)
 3. Pre-allocated tensors for sparse processing
 4. No torch.unique() - uses scatter_reduce instead
-5. Minimal CPU-GPU transfers
+5. Minimal CPU-GPU transfers (only transfer non-zero values, not full tensor)
 6. Float16 inference on GPU
 7. Cached special token mask (created once, not per-batch)
+8. Vectorized np.round() instead of per-element Python round()
+9. np.searchsorted for O(batch_size) grouping instead of O(n) loop
+10. Higher default MICRO_BATCH_SIZE for GPU (64 vs 32)
 """
 
 import os
@@ -16,6 +19,7 @@ import logging
 from typing import List, Dict, Any, Set
 
 import time
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -67,8 +71,11 @@ class BGEM3SparseModel:
         self.max_batch_size = max_batch_size
         self.max_length = max_length
         
-        # Micro-batch size
-        self.micro_batch_size = int(os.environ.get("MICRO_BATCH_SIZE", "8" if device == "cpu" else "32"))
+        # Micro-batch size (optimization #3: increase default for GPU)
+        # Higher micro_batch_size = fewer batches = less overhead
+        default_micro_batch = "8" if device == "cpu" else "64"
+        self.micro_batch_size = int(os.environ.get("MICRO_BATCH_SIZE", default_micro_batch))
+        logger.info(f"[CONFIG] MICRO_BATCH_SIZE={self.micro_batch_size} (env={os.environ.get('MICRO_BATCH_SIZE', 'not set')})")
 
         # Log GPU info at startup
         log_gpu_info()
@@ -260,30 +267,45 @@ class BGEM3SparseModel:
             torch.cuda.synchronize()
         t_postprocess = (time.perf_counter() - t0) * 1000
 
-        # === TIMING: Build results (VECTORIZED - much faster!) ===
+        # === TIMING: Build results (FULLY VECTORIZED) ===
         t0 = time.perf_counter()
-        
+
         # Find ALL non-zero positions at once using torch.nonzero
-        # This is MUCH faster than per-row torch.where
-        nonzero_coords = torch.nonzero(sparse_dense, as_tuple=False).cpu()
-        sparse_dense_cpu = sparse_dense.cpu()
-        
+        nonzero_coords = torch.nonzero(sparse_dense, as_tuple=False)
+
         # Pre-allocate results list
         results: List[List[Dict[str, Any]]] = [[] for _ in range(batch_size)]
-        
+
         if len(nonzero_coords) > 0:
-            batch_indices = nonzero_coords[:, 0].numpy()
-            token_indices = nonzero_coords[:, 1].numpy()
-            weights = sparse_dense_cpu[nonzero_coords[:, 0], nonzero_coords[:, 1]].numpy()
-            
-            # Group by batch index - use numpy for speed
-            for i in range(len(batch_indices)):
-                batch_idx = batch_indices[i]
-                results[batch_idx].append({
-                    "index": int(token_indices[i]),
-                    "value": round(float(weights[i]), 6)
-                })
-        
+            # Optimization #4: Extract weights on GPU BEFORE transfer
+            # This avoids transferring the entire (batch_size x vocab_size) tensor
+            batch_indices_gpu = nonzero_coords[:, 0]
+            token_indices_gpu = nonzero_coords[:, 1]
+            weights_gpu = sparse_dense[batch_indices_gpu, token_indices_gpu]
+
+            # Single CPU transfer for each array (optimization #4)
+            batch_indices = batch_indices_gpu.cpu().numpy()
+            token_indices = token_indices_gpu.cpu().numpy()
+            weights = weights_gpu.cpu().numpy()
+
+            # Optimization #2: Vectorized round using numpy (much faster than per-element)
+            weights = np.round(weights, 6)
+
+            # Optimization #1: Use searchsorted for batch grouping
+            # torch.nonzero returns in row-major order, so batch_indices are sorted
+            # This replaces the O(n) Python loop with O(batch_size) iterations
+            boundaries = np.searchsorted(batch_indices, np.arange(batch_size + 1))
+
+            for batch_idx in range(batch_size):
+                start = boundaries[batch_idx]
+                end = boundaries[batch_idx + 1]
+                if start < end:
+                    # List comprehension with zip is faster than append loop
+                    results[batch_idx] = [
+                        {"index": int(t), "value": float(w)}
+                        for t, w in zip(token_indices[start:end], weights[start:end])
+                    ]
+
         t_build = (time.perf_counter() - t0) * 1000
 
         logger.info(f"[TIMING] batch={batch_size}: tokenize={t_tokenize:.1f}ms, forward={t_forward:.1f}ms, postprocess={t_postprocess:.1f}ms, build={t_build:.1f}ms")
