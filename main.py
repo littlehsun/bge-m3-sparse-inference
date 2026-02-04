@@ -88,13 +88,21 @@ app = FastAPI(
 def run_embed_sparse_sync(inputs: List[str], truncate: bool):
     """Run sparse embedding with lock to prevent GPU contention"""
     with inference_lock:
-        return model.embed_sparse(inputs, truncate)
+        result = model.embed_sparse(inputs, truncate)
+        # Clear GPU cache after each request to prevent memory accumulation
+        if model.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return result
 
 
 def run_embed_dense_sync(inputs: List[str]):
     """Run dense embedding with lock to prevent GPU contention"""
     with inference_lock:
-        return model.embed_dense(inputs)
+        result = model.embed_dense(inputs)
+        # Clear GPU cache after each request to prevent memory accumulation
+        if model.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return result
 
 
 @app.get("/health")

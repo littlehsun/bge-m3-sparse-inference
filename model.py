@@ -310,6 +310,15 @@ class BGEM3SparseModel:
 
         logger.info(f"[TIMING] batch={batch_size}: tokenize={t_tokenize:.1f}ms, forward={t_forward:.1f}ms, postprocess={t_postprocess:.1f}ms, build={t_build:.1f}ms")
 
+        # === MEMORY CLEANUP: Explicitly delete GPU tensors ===
+        del inputs, input_ids, outputs, token_weights, sparse_dense
+        del is_special, token_weights_masked, nonzero_coords
+        # batch_indices_gpu etc. only exist when nonzero_coords was non-empty
+        try:
+            del batch_indices_gpu, token_indices_gpu, weights_gpu
+        except NameError:
+            pass
+
         return results
 
     @torch.inference_mode()
@@ -332,6 +341,10 @@ class BGEM3SparseModel:
                 batch_results = self._embed_sparse_batch(batch_texts, truncate)
                 results.extend(batch_results)
 
+                # Clear GPU cache periodically to prevent memory accumulation
+                if self.device.type == "cuda" and (i // self.micro_batch_size + 1) % 4 == 0:
+                    torch.cuda.empty_cache()
+
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         
@@ -347,7 +360,12 @@ class BGEM3SparseModel:
         outputs = self._model_forward(inputs, return_dense=True, return_sparse=False)
         dense_vecs = outputs["dense_vecs"]
         dense_vecs = F.normalize(dense_vecs, p=2, dim=-1)
-        return dense_vecs.cpu().tolist()
+        result = dense_vecs.cpu().tolist()
+
+        # === MEMORY CLEANUP: Explicitly delete GPU tensors ===
+        del inputs, outputs, dense_vecs
+
+        return result
 
     @torch.inference_mode()
     def embed_dense(self, texts: List[str]) -> List[List[float]]:
@@ -364,6 +382,10 @@ class BGEM3SparseModel:
                 batch_texts = texts[i:i + self.micro_batch_size]
                 batch_results = self._embed_dense_batch(batch_texts)
                 results.extend(batch_results)
+
+                # Clear GPU cache periodically to prevent memory accumulation
+                if self.device.type == "cuda" and (i // self.micro_batch_size + 1) % 4 == 0:
+                    torch.cuda.empty_cache()
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
