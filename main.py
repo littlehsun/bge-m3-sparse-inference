@@ -182,6 +182,29 @@ async def info():
     }
 
 
+@app.get("/gpu_memory")
+async def gpu_memory():
+    """Get current GPU memory usage"""
+    if not torch.cuda.is_available():
+        return {
+            "cuda_available": False,
+            "allocated_gb": 0,
+            "reserved_gb": 0,
+            "max_allocated_gb": 0,
+        }
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+
+    return {
+        "cuda_available": True,
+        "allocated_gb": round(allocated, 3),
+        "reserved_gb": round(reserved, 3),
+        "max_allocated_gb": round(max_allocated, 3),
+    }
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     workers = int(os.environ.get("WORKERS", "1"))

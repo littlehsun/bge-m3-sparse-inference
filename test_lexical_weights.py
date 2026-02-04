@@ -45,10 +45,26 @@ def load_models(model_id: str = "BAAI/bge-m3", device: str = None):
     return flag_model, custom_model
 
 
-def get_official_lexical_weights(flag_model, texts: List[str]) -> List[Dict[int, float]]:
-    """Get lexical weights using official FlagEmbedding API."""
+def get_official_lexical_weights(flag_model, texts: List[str], tokenizer) -> List[Dict[int, float]]:
+    """Get lexical weights using official FlagEmbedding API.
+
+    Note: Official API returns Dict[str, float] where keys are token ID strings (e.g., "32", "100").
+    We convert to Dict[int, float] where keys are actual token IDs for comparison.
+    """
     output = flag_model.encode(texts, return_dense=False, return_sparse=True, return_colbert_vecs=False)
-    return output['lexical_weights']
+    lexical_weights = output['lexical_weights']
+
+    # Convert token ID strings to integers
+    converted_results = []
+    for text_weights in lexical_weights:
+        id_weights = {}
+        for token_id_str, weight in text_weights.items():
+            # The key is already a token ID in string form, just convert to int
+            token_id = int(token_id_str)
+            id_weights[token_id] = weight
+        converted_results.append(id_weights)
+
+    return converted_results
 
 
 def get_custom_sparse_output(custom_model, texts: List[str]) -> List[Dict[int, float]]:
@@ -235,7 +251,7 @@ def run_tests(
 
         try:
             # Get outputs from both implementations
-            official_weights = get_official_lexical_weights(flag_model, [text])[0]
+            official_weights = get_official_lexical_weights(flag_model, [text], tokenizer)[0]
             custom_weights = get_custom_sparse_output(custom_model, [text])[0]
 
             # Compare
@@ -277,10 +293,11 @@ def run_batch_test(
     print(f"BATCH PROCESSING TEST (batch_size={batch_size})")
     print("=" * 60)
 
+    tokenizer = custom_model.tokenizer
     texts = [f"Test sentence number {i} for batch processing." for i in range(batch_size)]
 
     # Get batch outputs
-    official_weights = get_official_lexical_weights(flag_model, texts)
+    official_weights = get_official_lexical_weights(flag_model, texts, tokenizer)
     custom_weights = get_custom_sparse_output(custom_model, texts)
 
     passed = 0
@@ -316,7 +333,7 @@ def run_numerical_analysis(
     tokenizer = custom_model.tokenizer
 
     # Get outputs
-    official_weights = get_official_lexical_weights(flag_model, [text])[0]
+    official_weights = get_official_lexical_weights(flag_model, [text], tokenizer)[0]
     custom_weights = get_custom_sparse_output(custom_model, [text])[0]
 
     # Get tokenization for reference
