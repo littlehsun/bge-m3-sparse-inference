@@ -55,6 +55,13 @@ Our implementation achieves 2-3x performance improvements through these techniqu
 - CPU default: 8 texts per micro-batch
 - Configurable via `MICRO_BATCH_SIZE` environment variable
 
+**GPU Memory Utilization** (similar to vLLM): Limit GPU memory usage when sharing GPU with other services:
+- Set `GPU_MEMORY_UTILIZATION` to a fraction (0.0-1.0) of total GPU memory
+- Example: `GPU_MEMORY_UTILIZATION=0.5` on 80GB GPU limits PyTorch to 40GB
+- Useful when running alongside other GPU services (LLM inference, etc.)
+- When set, PyTorch will raise OOM error if allocation exceeds the limit
+- **Important**: Must also reduce `MICRO_BATCH_SIZE` proportionally to stay within the limit
+
 **Inference Lock**: Single-threaded inference prevents GPU resource contention and ensures stable memory usage.
 
 **Periodic Cache Clearing**: GPU cache is cleared every 4 micro-batches and after each request to prevent memory accumulation.
@@ -126,6 +133,8 @@ services:
       - DTYPE=float16
       - MICRO_BATCH_SIZE=64
       - MAX_LENGTH=8192
+      # Uncomment below to limit GPU memory (e.g., when sharing GPU)
+      # - GPU_MEMORY_UTILIZATION=0.5
     volumes:
       - huggingface-cache:/root/.cache/huggingface
     deploy:
@@ -178,6 +187,7 @@ python main.py
 | `MAX_LENGTH` | Maximum token length | `8192` | 1-8192 |
 | `PORT` | API server port | `8080` | Any valid port |
 | `WORKERS` | Uvicorn worker processes | `1` | 1+ (recommend 1 for GPU) |
+| `GPU_MEMORY_UTILIZATION` | Fraction of GPU memory to use (similar to vLLM) | Not set (use all) | `0.0`-`1.0` |
 
 ### CPU-Specific Variables
 
@@ -201,6 +211,27 @@ export MAX_LENGTH=8192
 export DEVICE=cuda
 export DTYPE=float16
 export MICRO_BATCH_SIZE=16
+export MAX_LENGTH=2048
+```
+
+**Shared GPU (80GB GPU, 40GB for this service):**
+```bash
+# When sharing GPU with other services (e.g., LLM inference using 40GB)
+# Limit this service to remaining 50% of GPU memory
+export DEVICE=cuda
+export DTYPE=float16
+export GPU_MEMORY_UTILIZATION=0.5    # Limit to 40GB
+export MICRO_BATCH_SIZE=32           # Reduce batch size proportionally
+export MAX_LENGTH=8192
+```
+
+**Shared GPU (16GB GPU, 8GB for this service):**
+```bash
+# Example: RTX 4080/5070 Ti sharing with other applications
+export DEVICE=cuda
+export DTYPE=float16
+export GPU_MEMORY_UTILIZATION=0.5    # Limit to 8GB
+export MICRO_BATCH_SIZE=8            # Small batch to fit in limited memory
 export MAX_LENGTH=2048
 ```
 
@@ -266,6 +297,10 @@ GET /gpu_memory
 ```json
 {
   "cuda_available": true,
+  "device_name": "NVIDIA A100-SXM4-80GB",
+  "total_memory_gb": 80.0,
+  "gpu_memory_utilization": 0.5,
+  "usable_memory_gb": 40.0,
   "allocated_gb": 4.832,
   "reserved_gb": 5.120,
   "max_allocated_gb": 4.956
@@ -283,11 +318,15 @@ GET /gpu_memory
 ```
 
 **Fields**:
+- `device_name`: GPU device name
+- `total_memory_gb`: Total GPU memory
+- `gpu_memory_utilization`: Configured memory fraction limit (1.0 if not set)
+- `usable_memory_gb`: Effective memory limit (`total * utilization`)
 - `allocated_gb`: Currently used GPU memory by tensors
 - `reserved_gb`: Memory reserved by PyTorch allocator
 - `max_allocated_gb`: Peak memory usage since server start
 
-**Use Case**: Monitor memory usage, detect memory leaks, capacity planning.
+**Use Case**: Monitor memory usage, detect memory leaks, capacity planning, verify memory limits.
 
 ---
 
@@ -827,6 +866,33 @@ for i in range(0, 1000, 64):
 
 ---
 
+### Can I share GPU with other services?
+
+**Yes!** Use `GPU_MEMORY_UTILIZATION` to limit this service's GPU memory usage:
+
+```bash
+# Example: 80GB GPU, other service uses 40GB, leave 40GB for this service
+export GPU_MEMORY_UTILIZATION=0.5
+export MICRO_BATCH_SIZE=32  # Must reduce batch size proportionally!
+```
+
+**Important notes**:
+1. `GPU_MEMORY_UTILIZATION` sets a **hard limit** - PyTorch will OOM if it tries to exceed
+2. It does NOT make PyTorch "smarter" - you must also reduce `MICRO_BATCH_SIZE`
+3. Monitor with `/gpu_memory` endpoint to verify settings are working
+4. Memory fragmentation may cause occasional OOM even within limits - reduce `MICRO_BATCH_SIZE` if this happens
+
+**Recommended settings for shared GPU**:
+
+| Available VRAM | `GPU_MEMORY_UTILIZATION` | `MICRO_BATCH_SIZE` |
+|----------------|--------------------------|-------------------|
+| 40GB (of 80GB) | 0.5 | 32-64 |
+| 20GB (of 80GB) | 0.25 | 16-32 |
+| 8GB (of 16GB) | 0.5 | 8 |
+| 6GB (of 12GB) | 0.5 | 4-8 |
+
+---
+
 ### Common error messages and solutions
 
 #### Error: "CUDA out of memory"
@@ -836,6 +902,12 @@ for i in range(0, 1000, 64):
 2. Reduce `MAX_LENGTH`: `export MAX_LENGTH=2048`
 3. Ensure no other processes using GPU: `nvidia-smi`
 4. Clear cache and restart: `docker restart <container>`
+
+**If using `GPU_MEMORY_UTILIZATION`**:
+- The error message will show "X GiB allowed" indicating the limit is working
+- Example: `7.96 GiB allowed` means limit is set correctly
+- Solution: Reduce `MICRO_BATCH_SIZE` further until stable
+- Memory fragmentation can cause intermittent OOM - try smaller batches
 
 #### Error: "Batch size X exceeds max Y"
 

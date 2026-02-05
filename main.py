@@ -47,12 +47,33 @@ class EmbedRequest(BaseModel):
 async def lifespan(app: FastAPI):
     """Initialize model on startup"""
     global model
-    
+
     model_id = os.environ.get("MODEL_ID", "BAAI/bge-m3")
     device = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
     dtype = os.environ.get("DTYPE", "float16" if device == "cuda" else "float32")
     max_batch_size = int(os.environ.get("MAX_BATCH_SIZE", "128"))
-    
+
+    # ==========================================================================
+    # GPU Memory Utilization (similar to vLLM's gpu_memory_utilization)
+    # This MUST be set before any CUDA memory allocation (i.e., before model load)
+    #
+    # When set, PyTorch will limit GPU memory usage to this fraction of total.
+    # This allows sharing GPU with other services without OOM.
+    #
+    # Example: GPU_MEMORY_UTILIZATION=0.5 on 80GB GPU = limit to 40GB
+    # ==========================================================================
+    gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION")
+    if device == "cuda" and torch.cuda.is_available() and gpu_memory_utilization:
+        fraction = float(gpu_memory_utilization)
+        if 0.0 < fraction <= 1.0:
+            torch.cuda.set_per_process_memory_fraction(fraction)
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            limited_memory = total_memory * fraction
+            logger.info(f"[GPU Memory] Limiting to {fraction:.0%} of GPU memory")
+            logger.info(f"[GPU Memory] Total: {total_memory:.1f}GB, Usable: {limited_memory:.1f}GB")
+        else:
+            logger.warning(f"[GPU Memory] Invalid GPU_MEMORY_UTILIZATION={fraction}, must be between 0.0 and 1.0")
+
     logger.info(f"Loading BGE-M3 model: {model_id}")
     logger.info(f"Device: {device}, Dtype: {dtype}, Max batch: {max_batch_size}")
     
@@ -196,9 +217,23 @@ async def gpu_memory():
     allocated = torch.cuda.memory_allocated() / 1024**3
     reserved = torch.cuda.memory_reserved() / 1024**3
     max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+    total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+
+    # Check if memory limit is set
+    gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION")
+    if gpu_memory_utilization:
+        fraction = float(gpu_memory_utilization)
+        limited_memory = total_memory * fraction
+    else:
+        fraction = 1.0
+        limited_memory = total_memory
 
     return {
         "cuda_available": True,
+        "device_name": torch.cuda.get_device_name(0),
+        "total_memory_gb": round(total_memory, 3),
+        "gpu_memory_utilization": fraction,
+        "usable_memory_gb": round(limited_memory, 3),
         "allocated_gb": round(allocated, 3),
         "reserved_gb": round(reserved, 3),
         "max_allocated_gb": round(max_allocated, 3),
