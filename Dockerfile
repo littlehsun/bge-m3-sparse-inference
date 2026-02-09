@@ -6,16 +6,17 @@ WORKDIR /app
 ARG http_proxy
 ARG https_proxy
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl git vim && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py model.py ./
-
 # Pre-download model weights during build
 RUN python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device='cpu')" && \
     echo "Model downloaded successfully"
+
+COPY main.py model.py ./
+COPY vram_stress ./vram_stress
 
 ENV MODEL_ID=BAAI/bge-m3
 ENV DEVICE=cuda
