@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:24.10-py3
+FROM nvcr.io/nvidia/pytorch:25.10-py3
 
 WORKDIR /app
 
@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download model weights during build
+RUN pip uninstall -y apex
 RUN python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3', use_fp16=True, device='cpu')" && \
     echo "Model downloaded successfully"
 
