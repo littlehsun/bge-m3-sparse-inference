@@ -30,6 +30,22 @@ model: Optional[BGEM3SparseModel] = None
 inference_lock = threading.Lock()
 
 
+def _runtime_device() -> str:
+    requested = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and device.index is None and torch.cuda.is_available():
+        return f"cuda:{torch.cuda.current_device()}"
+    return str(device)
+
+
+def _validate_worker_config(device: str, workers: int):
+    if torch.device(device).type == "cuda" and workers != 1:
+        raise RuntimeError(
+            "GPU inference requires WORKERS=1. Multiple uvicorn workers each load "
+            "a full model copy and inference_lock does not synchronize across processes."
+        )
+
+
 class EmbedSparseRequest(BaseModel):
     """Request format compatible with TEI"""
     inputs: Union[str, List[str]]
@@ -49,9 +65,12 @@ async def lifespan(app: FastAPI):
     global model
 
     model_id = os.environ.get("MODEL_ID", "BAAI/bge-m3")
-    device = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-    dtype = os.environ.get("DTYPE", "float16" if device == "cuda" else "float32")
+    device = _runtime_device()
+    device_type = torch.device(device).type
+    dtype = os.environ.get("DTYPE", "float16" if device_type == "cuda" else "float32")
     max_batch_size = int(os.environ.get("MAX_BATCH_SIZE", "128"))
+    workers = int(os.environ.get("WORKERS", "1"))
+    _validate_worker_config(device, workers)
 
     # ==========================================================================
     # GPU Memory Utilization (similar to vLLM's gpu_memory_utilization)
@@ -63,11 +82,12 @@ async def lifespan(app: FastAPI):
     # Example: GPU_MEMORY_UTILIZATION=0.5 on 80GB GPU = limit to 40GB
     # ==========================================================================
     gpu_memory_utilization = os.environ.get("GPU_MEMORY_UTILIZATION")
-    if device == "cuda" and torch.cuda.is_available() and gpu_memory_utilization:
+    if device_type == "cuda" and torch.cuda.is_available() and gpu_memory_utilization:
         fraction = float(gpu_memory_utilization)
         if 0.0 < fraction <= 1.0:
-            torch.cuda.set_per_process_memory_fraction(fraction)
-            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            cuda_device = torch.device(device)
+            torch.cuda.set_per_process_memory_fraction(fraction, device=cuda_device)
+            total_memory = torch.cuda.get_device_properties(cuda_device).total_memory / 1024**3
             limited_memory = total_memory * fraction
             logger.info(f"[GPU Memory] Limiting to {fraction:.0%} of GPU memory")
             logger.info(f"[GPU Memory] Total: {total_memory:.1f}GB, Usable: {limited_memory:.1f}GB")
@@ -94,8 +114,10 @@ async def lifespan(app: FastAPI):
     yield
     
     # Cleanup
-    del model
-    if device == "cuda":
+    loaded_model = model
+    model = None
+    del loaded_model
+    if device_type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
@@ -109,21 +131,25 @@ app = FastAPI(
 def run_embed_sparse_sync(inputs: List[str], truncate: bool):
     """Run sparse embedding with lock to prevent GPU contention"""
     with inference_lock:
-        result = model.embed_sparse(inputs, truncate)
-        # Clear GPU cache after each request to prevent memory accumulation
-        if model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        return result
+        try:
+            return model.embed_sparse(inputs, truncate)
+        finally:
+            # Clear GPU cache after both successful requests and exceptions.
+            current_model = model
+            if current_model is not None and current_model.device.type == "cuda":
+                torch.cuda.empty_cache()
 
 
 def run_embed_dense_sync(inputs: List[str]):
     """Run dense embedding with lock to prevent GPU contention"""
     with inference_lock:
-        result = model.embed_dense(inputs)
-        # Clear GPU cache after each request to prevent memory accumulation
-        if model.device.type == "cuda":
-            torch.cuda.empty_cache()
-        return result
+        try:
+            return model.embed_dense(inputs)
+        finally:
+            # Clear GPU cache after both successful requests and exceptions.
+            current_model = model
+            if current_model is not None and current_model.device.type == "cuda":
+                torch.cuda.empty_cache()
 
 
 @app.get("/health")
@@ -243,6 +269,11 @@ async def gpu_memory():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     workers = int(os.environ.get("WORKERS", "1"))
+    runtime_device = _runtime_device()
+    try:
+        _validate_worker_config(runtime_device, workers)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     
     uvicorn.run(
         "main:app",

@@ -15,6 +15,11 @@ Key optimizations:
 """
 
 import os
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:512,expandable_segments:True",
+)
+
 import logging
 from typing import List, Dict, Any, Set
 
@@ -27,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 # Disable tqdm progress bars
 os.environ["TQDM_DISABLE"] = "1"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def canonicalize_torch_device(device: str) -> torch.device:
+    parsed = torch.device(device)
+    if parsed.type == "cuda" and parsed.index is None and torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return parsed
 
 
 def log_gpu_info():
@@ -66,16 +85,19 @@ class BGEM3SparseModel:
         compile_model: bool = False,  # Disabled - incompatible with FlagEmbedding
     ):
         self.model_id = model_id
-        self.device = torch.device(device)
+        self.device = canonicalize_torch_device(device)
         self.dtype = dtype
         self.max_batch_size = max_batch_size
         self.max_length = max_length
+        self.enable_timing = env_flag("ENABLE_TIMING", False)
+        self._sparse_dense_buffer = None
         
         # Micro-batch size (optimization #3: increase default for GPU)
         # Higher micro_batch_size = fewer batches = less overhead
-        default_micro_batch = "8" if device == "cpu" else "64"
+        default_micro_batch = "8" if self.device.type == "cpu" else "64"
         self.micro_batch_size = int(os.environ.get("MICRO_BATCH_SIZE", default_micro_batch))
         logger.info(f"[CONFIG] MICRO_BATCH_SIZE={self.micro_batch_size} (env={os.environ.get('MICRO_BATCH_SIZE', 'not set')})")
+        logger.info(f"[CONFIG] ENABLE_TIMING={self.enable_timing}")
 
         # Log GPU info at startup
         log_gpu_info()
@@ -90,10 +112,6 @@ class BGEM3SparseModel:
 
         # Configure CUDA for stability
         if self.device.type == "cuda":
-            os.environ.setdefault(
-                "PYTORCH_CUDA_ALLOC_CONF",
-                "max_split_size_mb:512,expandable_segments:True",
-            )
             torch.cuda.empty_cache()
 
         use_fp16 = dtype in [torch.float16, torch.bfloat16]
@@ -210,6 +228,32 @@ class BGEM3SparseModel:
             )
         return outputs
 
+    def _sync_for_timing(self):
+        if self.enable_timing and self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+    def _get_sparse_dense_buffer(self, batch_size: int, dtype: torch.dtype) -> torch.Tensor:
+        rows = max(batch_size, min(self.micro_batch_size, self.max_batch_size))
+        buffer = self._sparse_dense_buffer
+        needs_alloc = (
+            buffer is None
+            or buffer.shape[0] < batch_size
+            or buffer.shape[1] != self.vocab_size
+            or buffer.dtype != dtype
+            or buffer.device != self.device
+        )
+        if needs_alloc:
+            self._sparse_dense_buffer = torch.empty(
+                (rows, self.vocab_size),
+                device=self.device,
+                dtype=dtype,
+            )
+            buffer = self._sparse_dense_buffer
+
+        sparse_dense = buffer[:batch_size]
+        sparse_dense.zero_()
+        return sparse_dense
+
     def _embed_sparse_batch(
         self,
         texts: List[str],
@@ -217,109 +261,102 @@ class BGEM3SparseModel:
     ) -> List[List[Dict[str, Any]]]:
         """Process a single batch of texts for sparse embeddings - OPTIMIZED"""
         batch_size = len(texts)
-        
-        # === TIMING: Tokenize ===
-        t0 = time.perf_counter()
-        inputs = self._tokenize(texts, truncate)
-        input_ids = inputs["input_ids"]
-        t_tokenize = (time.perf_counter() - t0) * 1000
+        inputs = input_ids = outputs = token_weights = sparse_dense = None
+        is_special = token_weights_masked = nonzero_coords = None
+        batch_indices_gpu = token_indices_gpu = weights_gpu = None
 
-        # === TIMING: Model forward ===
-        t0 = time.perf_counter()
-        outputs = self._model_forward(inputs, return_dense=False, return_sparse=True)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        t_forward = (time.perf_counter() - t0) * 1000
-
-        # === TIMING: Post-processing (VECTORIZED) ===
-        t0 = time.perf_counter()
-        
-        token_weights = outputs["sparse_vecs"]
-        if token_weights.dim() == 3:
-            token_weights = token_weights.squeeze(-1)
-
-        token_weights = torch.relu(token_weights)
-
-        # Create dense (batch, vocab) tensor for max weights per token
-        sparse_dense = torch.zeros(
-            (batch_size, self.vocab_size),
-            device=self.device,
-            dtype=token_weights.dtype,
-        )
-
-        # Mask special tokens
-        is_special = self._special_mask[input_ids]
-        token_weights_masked = token_weights.masked_fill(is_special, 0.0)
-
-        # Scatter max
-        sparse_dense.scatter_reduce_(
-            dim=1,
-            index=input_ids.long(),
-            src=token_weights_masked,
-            reduce="amax",
-            include_self=True,
-        )
-
-        # Apply threshold on GPU before transfer
-        sparse_dense = sparse_dense * (sparse_dense > 0.001).float()
-        
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        t_postprocess = (time.perf_counter() - t0) * 1000
-
-        # === TIMING: Build results (FULLY VECTORIZED) ===
-        t0 = time.perf_counter()
-
-        # Find ALL non-zero positions at once using torch.nonzero
-        nonzero_coords = torch.nonzero(sparse_dense, as_tuple=False)
-
-        # Pre-allocate results list
-        results: List[List[Dict[str, Any]]] = [[] for _ in range(batch_size)]
-
-        if len(nonzero_coords) > 0:
-            # Optimization #4: Extract weights on GPU BEFORE transfer
-            # This avoids transferring the entire (batch_size x vocab_size) tensor
-            batch_indices_gpu = nonzero_coords[:, 0]
-            token_indices_gpu = nonzero_coords[:, 1]
-            weights_gpu = sparse_dense[batch_indices_gpu, token_indices_gpu]
-
-            # Single CPU transfer for each array (optimization #4)
-            batch_indices = batch_indices_gpu.cpu().numpy()
-            token_indices = token_indices_gpu.cpu().numpy()
-            weights = weights_gpu.cpu().numpy()
-
-            # Optimization #2: Vectorized round using numpy (much faster than per-element)
-            weights = np.round(weights, 6)
-
-            # Optimization #1: Use searchsorted for batch grouping
-            # torch.nonzero returns in row-major order, so batch_indices are sorted
-            # This replaces the O(n) Python loop with O(batch_size) iterations
-            boundaries = np.searchsorted(batch_indices, np.arange(batch_size + 1))
-
-            for batch_idx in range(batch_size):
-                start = boundaries[batch_idx]
-                end = boundaries[batch_idx + 1]
-                if start < end:
-                    # List comprehension with zip is faster than append loop
-                    results[batch_idx] = [
-                        {"index": int(t), "value": float(w)}
-                        for t, w in zip(token_indices[start:end], weights[start:end])
-                    ]
-
-        t_build = (time.perf_counter() - t0) * 1000
-
-        logger.info(f"[TIMING] batch={batch_size}: tokenize={t_tokenize:.1f}ms, forward={t_forward:.1f}ms, postprocess={t_postprocess:.1f}ms, build={t_build:.1f}ms")
-
-        # === MEMORY CLEANUP: Explicitly delete GPU tensors ===
-        del inputs, input_ids, outputs, token_weights, sparse_dense
-        del is_special, token_weights_masked, nonzero_coords
-        # batch_indices_gpu etc. only exist when nonzero_coords was non-empty
         try:
-            del batch_indices_gpu, token_indices_gpu, weights_gpu
-        except NameError:
-            pass
+            t0 = time.perf_counter()
+            inputs = self._tokenize(texts, truncate)
+            input_ids = inputs["input_ids"]
+            if self.enable_timing:
+                t_tokenize = (time.perf_counter() - t0) * 1000
 
-        return results
+            t0 = time.perf_counter()
+            outputs = self._model_forward(inputs, return_dense=False, return_sparse=True)
+            self._sync_for_timing()
+            if self.enable_timing:
+                t_forward = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            token_weights = outputs["sparse_vecs"]
+            if token_weights.dim() == 3:
+                token_weights = token_weights.squeeze(-1)
+
+            token_weights = torch.relu(token_weights)
+            sparse_dense = self._get_sparse_dense_buffer(batch_size, token_weights.dtype)
+
+            # Mask special tokens
+            is_special = self._special_mask[input_ids]
+            token_weights_masked = token_weights.masked_fill(is_special, 0.0)
+
+            # Scatter max
+            sparse_dense.scatter_reduce_(
+                dim=1,
+                index=input_ids.long(),
+                src=token_weights_masked,
+                reduce="amax",
+                include_self=True,
+            )
+
+            # Apply threshold in-place to avoid promoting the full dense buffer to fp32.
+            sparse_dense.masked_fill_(sparse_dense <= 0.001, 0.0)
+
+            self._sync_for_timing()
+            if self.enable_timing:
+                t_postprocess = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+
+            # Find ALL non-zero positions at once using torch.nonzero
+            nonzero_coords = torch.nonzero(sparse_dense, as_tuple=False)
+
+            # Pre-allocate results list
+            results: List[List[Dict[str, Any]]] = [[] for _ in range(batch_size)]
+
+            if len(nonzero_coords) > 0:
+                # Optimization #4: Extract weights on GPU BEFORE transfer
+                # This avoids transferring the entire (batch_size x vocab_size) tensor
+                batch_indices_gpu = nonzero_coords[:, 0]
+                token_indices_gpu = nonzero_coords[:, 1]
+                weights_gpu = sparse_dense[batch_indices_gpu, token_indices_gpu]
+
+                # Single CPU transfer for each array (optimization #4)
+                batch_indices = batch_indices_gpu.cpu().numpy()
+                token_indices = token_indices_gpu.cpu().numpy()
+                weights = weights_gpu.float().cpu().numpy()
+
+                # Optimization #2: Vectorized round using numpy (much faster than per-element)
+                weights = np.round(weights, 6)
+
+                # Optimization #1: Use searchsorted for batch grouping
+                # torch.nonzero returns in row-major order, so batch_indices are sorted
+                # This replaces the O(n) Python loop with O(batch_size) iterations
+                boundaries = np.searchsorted(batch_indices, np.arange(batch_size + 1))
+
+                for batch_idx in range(batch_size):
+                    start = boundaries[batch_idx]
+                    end = boundaries[batch_idx + 1]
+                    if start < end:
+                        # List comprehension with zip is faster than append loop
+                        results[batch_idx] = [
+                            {"index": int(t), "value": float(w)}
+                            for t, w in zip(token_indices[start:end], weights[start:end])
+                        ]
+
+            if self.enable_timing:
+                t_build = (time.perf_counter() - t0) * 1000
+                logger.info(
+                    f"[TIMING] batch={batch_size}: tokenize={t_tokenize:.1f}ms, "
+                    f"forward={t_forward:.1f}ms, postprocess={t_postprocess:.1f}ms, "
+                    f"build={t_build:.1f}ms"
+                )
+
+            return results
+        finally:
+            del inputs, input_ids, outputs, token_weights, sparse_dense
+            del is_special, token_weights_masked, nonzero_coords
+            del batch_indices_gpu, token_indices_gpu, weights_gpu
 
     @torch.inference_mode()
     def embed_sparse(
@@ -345,8 +382,7 @@ class BGEM3SparseModel:
                 if self.device.type == "cuda" and (i // self.micro_batch_size + 1) % 4 == 0:
                     torch.cuda.empty_cache()
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync_for_timing()
         
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
@@ -356,16 +392,15 @@ class BGEM3SparseModel:
 
     def _embed_dense_batch(self, texts: List[str]) -> List[List[float]]:
         """Process a single batch of texts for dense embeddings"""
-        inputs = self._tokenize(texts, truncate=True)
-        outputs = self._model_forward(inputs, return_dense=True, return_sparse=False)
-        dense_vecs = outputs["dense_vecs"]
-        dense_vecs = F.normalize(dense_vecs, p=2, dim=-1)
-        result = dense_vecs.cpu().tolist()
-
-        # === MEMORY CLEANUP: Explicitly delete GPU tensors ===
-        del inputs, outputs, dense_vecs
-
-        return result
+        inputs = outputs = dense_vecs = None
+        try:
+            inputs = self._tokenize(texts, truncate=True)
+            outputs = self._model_forward(inputs, return_dense=True, return_sparse=False)
+            dense_vecs = outputs["dense_vecs"]
+            dense_vecs = F.normalize(dense_vecs, p=2, dim=-1)
+            return dense_vecs.cpu().tolist()
+        finally:
+            del inputs, outputs, dense_vecs
 
     @torch.inference_mode()
     def embed_dense(self, texts: List[str]) -> List[List[float]]:
@@ -387,8 +422,7 @@ class BGEM3SparseModel:
                 if self.device.type == "cuda" and (i // self.micro_batch_size + 1) % 4 == 0:
                     torch.cuda.empty_cache()
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync_for_timing()
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.info(

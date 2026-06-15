@@ -186,8 +186,9 @@ python main.py
 | `MICRO_BATCH_SIZE` | Internal batch size for memory management | `64` (GPU), `8` (CPU) | Adjust based on GPU memory |
 | `MAX_LENGTH` | Maximum token length | `8192` | 1-8192 |
 | `PORT` | API server port | `8080` | Any valid port |
-| `WORKERS` | Uvicorn worker processes | `1` | 1+ (recommend 1 for GPU) |
+| `WORKERS` | Uvicorn worker processes | `1` | Must be `1` for GPU |
 | `GPU_MEMORY_UTILIZATION` | Fraction of GPU memory to use (similar to vLLM) | Not set (use all) | `0.0`-`1.0` |
+| `ENABLE_TIMING` | Enable per-stage CUDA-synchronized timing logs | `false` | `true`, `false` |
 
 ### CPU-Specific Variables
 
@@ -617,7 +618,7 @@ GPU Memory Analysis:
 
 ### Understanding Timing Logs
 
-The service outputs detailed timing information for each request:
+Set `ENABLE_TIMING=1` to output detailed CUDA-synchronized timing information for each request:
 ```
 [TIMING] batch=100: tokenize=50ms, forward=2000ms, postprocess=5ms, build=10ms
 ```
