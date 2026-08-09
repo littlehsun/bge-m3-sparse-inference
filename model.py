@@ -145,14 +145,23 @@ class BGEM3SparseModel:
         self.tokenizer = self.flag_model.tokenizer
         self.vocab_size = len(self.tokenizer)
 
-        # Cache special token IDs
+        # Sparse weight threshold. Official FlagEmbedding keeps every token with
+        # weight > 0; it applies NO magnitude threshold. We default to 0 to match
+        # official output exactly. Set SPARSE_THRESHOLD=0.001 to restore the old
+        # noise-filtering behaviour (drops tokens with weight <= threshold).
+        self.sparse_threshold = float(os.environ.get("SPARSE_THRESHOLD", "0"))
+        logger.info(f"[CONFIG] SPARSE_THRESHOLD={self.sparse_threshold} (0 = match official, no filtering)")
+
+        # Cache special token IDs. Exclude EXACTLY what official FlagEmbedding
+        # _process_token_weights excludes: {cls, eos, pad, unk}.
+        # (xlm-roberta sets sep==eos, so "eos" covers both. We deliberately do NOT
+        # exclude mask_token_id — official keeps it.)
         self._special_token_ids: Set[int] = set()
         for attr in [
             "cls_token_id",
-            "sep_token_id",
+            "eos_token_id",
             "pad_token_id",
             "unk_token_id",
-            "mask_token_id",
         ]:
             tid = getattr(self.tokenizer, attr, None)
             if tid is not None:
@@ -299,8 +308,11 @@ class BGEM3SparseModel:
                 include_self=True,
             )
 
-            # Apply threshold in-place to avoid promoting the full dense buffer to fp32.
-            sparse_dense.masked_fill_(sparse_dense <= 0.001, 0.0)
+            # Apply threshold in-place (keeps buffer in fp16, avoiding a full-buffer
+            # fp32 promotion). When sparse_threshold == 0 we skip it entirely to match
+            # official FlagEmbedding output (which keeps every weight > 0).
+            if self.sparse_threshold > 0:
+                sparse_dense.masked_fill_(sparse_dense <= self.sparse_threshold, 0.0)
 
             self._sync_for_timing()
             if self.enable_timing:
